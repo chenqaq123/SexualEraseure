@@ -6,3 +6,4 @@ refs/
 *.txt
 eval_outputs/
 artifacts/
+.DS_Store/
