@@ -1,0 +1,8 @@
+*.json
+*.pt
+__pycache__/
+*.png
+refs/
+*.txt
+eval_outputs/
+artifacts/
