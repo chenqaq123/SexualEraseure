@@ -1,13 +1,31 @@
+"""Guard artifact builder.
+
+Orchestrates the full CAD + SSV pipeline:
+
+1. **CAD localisation** — gradient attribution identifies which FFN layers and
+   channels respond most strongly to the target concept.
+2. **SSV scoring** — activation statistics (positive minus negative mean)
+   further filter channels that are both concept-sensitive *and* have
+   meaningful activation differences.
+3. **Artifact assembly** — the top-ranked channels and their steering vectors
+   are packed into a :class:`~cad_ssv_guard.artifact.GuardArtifact`.
+"""
+
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional
 
 import torch
 
 from .artifact import GuardArtifact, GuardLayer
+from .backend import ModelBackend
 from .cad import compute_nudity_cad_scores
 from .ssv import collect_mean_activation, compute_ssv_scores, normalize_nonnegative
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _topk_indices(values: torch.Tensor, k: int) -> torch.Tensor:
     k = min(k, values.numel())
@@ -21,18 +39,22 @@ def _allocate_layer_budgets(
     total_budget: int,
     min_per_layer: int,
 ) -> List[int]:
+    """Distribute ``total_budget`` channels across layers proportionally to
+    their layer scores, guaranteeing at least ``min_per_layer`` per layer."""
     num_layers = len(ranked_layers)
     if num_layers == 0:
         return []
 
     total_budget = max(total_budget, num_layers)
     min_per_layer = max(1, min(min_per_layer, total_budget // num_layers))
-    budgets = [min_per_layer for _ in range(num_layers)]
+    budgets = [min_per_layer] * num_layers
     remaining = total_budget - sum(budgets)
     if remaining <= 0:
         return budgets
 
-    scores = torch.tensor([layer.layer_score for layer in ranked_layers], dtype=torch.float32)
+    scores = torch.tensor(
+        [layer.layer_score for layer in ranked_layers], dtype=torch.float32
+    )
     if float(scores.sum().item()) <= 0.0:
         scores = torch.ones_like(scores) / num_layers
     else:
@@ -40,7 +62,8 @@ def _allocate_layer_budgets(
 
     fractional = scores * remaining
     floor_alloc = torch.floor(fractional).to(torch.int64)
-    budgets = [budget + int(extra) for budget, extra in zip(budgets, floor_alloc.tolist())]
+    budgets = [b + int(e) for b, e in zip(budgets, floor_alloc.tolist())]
+
     leftover = remaining - int(floor_alloc.sum().item())
     if leftover > 0:
         order = torch.argsort(fractional - floor_alloc.float(), descending=True).tolist()
@@ -49,8 +72,13 @@ def _allocate_layer_budgets(
     return budgets
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Main builder
+# ─────────────────────────────────────────────────────────────────────────────
+
 def build_nudity_guard(
     pipe,
+    backend: ModelBackend,
     positive_prompts: List[str],
     negative_prompts: List[str],
     target: str = "nudity",
@@ -58,43 +86,109 @@ def build_nudity_guard(
     base_prompt: str = "",
     cad_steps: int = 50,
     cad_num_samples: int = 4,
-    num_inference_steps: int = 30,
-    guidance_scale: float = 7.5,
+    num_inference_steps: Optional[int] = None,
+    guidance_scale: Optional[float] = None,
     num_layers: int = 3,
     cad_candidate_topk: int = 256,
     steering_topk: int = 32,
-    total_steering_channels: int | None = None,
+    total_steering_channels: Optional[int] = None,
     min_channels_per_layer: int = 8,
-    alpha: float = 2.0,
+    alpha: float = 1.0,
     seed: int = 0,
+    height: Optional[int] = None,
+    width: Optional[int] = None,
 ) -> GuardArtifact:
+    """Build a concept-erasing guard artifact for SD1, SD3, or FLUX.
+
+    Parameters
+    ----------
+    pipe:
+        Loaded diffusers pipeline.
+    backend:
+        Model-specific backend (``get_backend("sd1" | "sd3" | "flux")``).
+    positive_prompts:
+        Prompts describing the concept to suppress (e.g. nudity).
+    negative_prompts:
+        Safe/neutral prompts used as the reference baseline.
+    target:
+        Human-readable label stored in the artifact (e.g. ``"nudity"``).
+    concept_prompt / base_prompt:
+        Fallback single-pair prompts when the prompt lists are empty.
+    cad_steps:
+        Number of scheduler timesteps for CAD attribution.
+    cad_num_samples:
+        Number of noise samples per prompt pair for CAD.
+    num_inference_steps:
+        Steps used when collecting SSV activation statistics.
+        Defaults to ``backend.default_inference_steps``.
+    guidance_scale:
+        Guidance scale for SSV collection.
+        Defaults to ``backend.default_guidance_scale``.
+    num_layers:
+        How many FFN layers (ranked by CAD layer score) to include.
+    cad_candidate_topk:
+        Number of top CAD channels considered as candidates per layer.
+    steering_topk:
+        Per-layer budget hint (total may be adjusted by ``_allocate_layer_budgets``).
+    total_steering_channels:
+        Hard total budget across all layers.  Defaults to
+        ``steering_topk × num_layers``.
+    min_channels_per_layer:
+        Minimum channel allocation per layer.
+    alpha:
+        Steering strength stored in the artifact (can be overridden at
+        inference time).
+    seed:
+        Base random seed.
+    height / width:
+        Resolution used for CAD attribution.
+
+    Returns
+    -------
+    GuardArtifact
+        Ready-to-save artifact with steering vectors for the selected channels.
+    """
+    num_inference_steps = num_inference_steps or backend.default_inference_steps
+    guidance_scale = guidance_scale or backend.default_guidance_scale
+    height = height or backend.default_height
+    width = width or backend.default_width
+
+    # ── Step 1 : CAD — rank layers and channels by concept sensitivity ────────
     layer_scores = compute_nudity_cad_scores(
         pipe=pipe,
+        backend=backend,
         positive_prompts=positive_prompts,
         negative_prompts=negative_prompts,
         concept_prompt=concept_prompt,
         base_prompt=base_prompt,
         num_steps=cad_steps,
         num_samples=cad_num_samples,
-        guidance_scale=guidance_scale,
         seed=seed,
+        height=height,
+        width=width,
     )
-    module_lookup = dict(pipe.unet.named_modules())
+
+    backbone = backend.get_backbone(pipe)
+    module_lookup = dict(backbone.named_modules())
+
     ranked_layers = sorted(
         layer_scores.values(),
-        key=lambda item: item.layer_score,
+        key=lambda x: x.layer_score,
         reverse=True,
     )
     ranked_layers = ranked_layers[: min(num_layers, len(ranked_layers))]
+
     if total_steering_channels is None:
         total_steering_channels = steering_topk * len(ranked_layers)
+
     budgets = _allocate_layer_budgets(
         ranked_layers=ranked_layers,
         total_budget=total_steering_channels,
         min_per_layer=min_channels_per_layer,
     )
 
-    guard_layers = []
+    # ── Step 2 : SSV — collect activation statistics and build steering vectors
+    guard_layers: List[GuardLayer] = []
     for layer_idx, (layer, layer_budget) in enumerate(zip(ranked_layers, budgets)):
         hidden_module = module_lookup[layer.spec.hidden_module_name]
 
@@ -115,6 +209,8 @@ def build_nudity_guard(
             seed=seed + 10_000 + layer_idx * 1_000,
         )
 
+        # Combine CAD and SSV scores: prefer channels that are *both*
+        # concept-sensitive (CAD) *and* have large activation differences (SSV).
         cad_scores = normalize_nonnegative(layer.channel_scores)
         ssv_scores = normalize_nonnegative(
             compute_ssv_scores(positive_stats.mean, negative_stats.mean)
@@ -123,7 +219,12 @@ def build_nudity_guard(
         combined_scores = cad_scores[candidate_indices] * ssv_scores[candidate_indices]
         top_local = _topk_indices(combined_scores, layer_budget)
         selected_channels = candidate_indices[top_local]
-        steering_vector = (positive_stats.mean - negative_stats.mean)[selected_channels].float()
+
+        # Steering vector: mean positive activation minus mean negative activation
+        # projected onto the selected channel subset.
+        steering_vector = (
+            (positive_stats.mean - negative_stats.mean)[selected_channels].float()
+        )
 
         guard_layers.append(
             GuardLayer(
@@ -139,6 +240,7 @@ def build_nudity_guard(
             )
         )
 
+    # ── Step 3 : Pack into artifact ───────────────────────────────────────────
     return GuardArtifact(
         model_id=pipe.config._name_or_path,
         target=target,
@@ -152,6 +254,8 @@ def build_nudity_guard(
         positive_prompts=positive_prompts,
         negative_prompts=negative_prompts,
         metadata={
+            "model_type": backend.model_type,
+            "backbone": "transformer" if hasattr(pipe, "transformer") else "unet",
             "selected_ffn_layers": [layer.ff_name for layer in guard_layers],
             "num_layers": len(guard_layers),
             "layer_budgets": budgets,

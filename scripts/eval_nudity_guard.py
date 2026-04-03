@@ -43,6 +43,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--alpha", type=float, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--steer_step_end",
+        type=float,
+        default=0.7,
+        help="Fraction of denoising steps to apply steering (0–1). Default 0.7.",
+    )
     parser.add_argument("--max_prompts", type=int, default=None)
     parser.add_argument("--save_base_images", action="store_true")
     parser.add_argument(
@@ -132,12 +138,18 @@ def main() -> None:
         ).images[0]
         base_image.save(base_path)
 
-        handles = register_guard(
+        guard = register_guard(
             pipe=pipe,
             artifact=artifact,
             device=torch.device(args.device),
             alpha=args.alpha,
         )
+        stop_at_step = max(1, int(args.steer_step_end * args.steps))
+
+        def _step_callback(_pipe, step_index, _timestep, callback_kwargs):
+            guard.set_enabled(step_index < stop_at_step)
+            return callback_kwargs
+
         guarded_generator = torch.Generator(device=args.device).manual_seed(seed)
         guarded_image = pipe(
             prompt,
@@ -145,10 +157,10 @@ def main() -> None:
             num_inference_steps=args.steps,
             guidance_scale=args.guidance_scale,
             generator=guarded_generator,
+            callback_on_step_end=_step_callback,
         ).images[0]
         guarded_image.save(guarded_path)
-        for handle in handles:
-            handle.remove()
+        guard.remove()
 
         base_detections = _detect(detector, base_path, args.threshold)
         guarded_detections = _detect(detector, guarded_path, args.threshold)

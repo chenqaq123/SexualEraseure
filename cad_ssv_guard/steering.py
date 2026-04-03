@@ -13,7 +13,8 @@ class SparseSteeringController:
     module_name: str
     channel_indices: torch.Tensor
     steering_vector: torch.Tensor
-    alpha: float = 2.0
+    alpha: float = 1.0
+    enabled: bool = True
 
     @classmethod
     def from_layer(
@@ -21,7 +22,7 @@ class SparseSteeringController:
         layer: GuardLayer,
         device: Optional[torch.device] = None,
         alpha: Optional[float] = None,
-        default_alpha: float = 2.0,
+        default_alpha: float = 1.0,
     ) -> "SparseSteeringController":
         vector = torch.tensor(layer.steering_vector, dtype=torch.float32, device=device)
         indices = torch.tensor(layer.selected_channels, dtype=torch.long, device=device)
@@ -83,8 +84,19 @@ class SparseSteeringController:
 
     def register(self, module):
         def hook(_module, _inputs, output):
+            if not self.enabled:
+                return output
             hidden = output[0] if isinstance(output, tuple) else output
-            steered = self.steer(hidden)
+
+            # CFG convention in diffusers: batch = [uncond, cond] when size == 2.
+            # Only steer the conditional pass; the unconditional baseline must stay
+            # intact so the CFG guidance direction is preserved.
+            if hidden.shape[0] == 2:
+                steered = hidden.clone()
+                steered[1:2] = self.steer(hidden[1:2])
+            else:
+                steered = self.steer(hidden)
+
             if isinstance(output, tuple):
                 return (steered, *output[1:])
             return steered
@@ -92,8 +104,16 @@ class SparseSteeringController:
         return module.register_forward_hook(hook)
 
 
+def _get_backbone(pipe):
+    """Return the denoising backbone: `pipe.transformer` for DiT-based models
+    (SD3, FLUX, etc.) or `pipe.unet` for UNet-based models (SD1/SD2/SDXL)."""
+    if hasattr(pipe, "transformer"):
+        return pipe.transformer
+    return pipe.unet
+
+
 def attach_controller(pipe, controller: SparseSteeringController):
-    module_lookup = dict(pipe.unet.named_modules())
+    module_lookup = dict(_get_backbone(pipe).named_modules())
     module = module_lookup[controller.module_name]
     return controller.register(module)
 
@@ -101,6 +121,7 @@ def attach_controller(pipe, controller: SparseSteeringController):
 @dataclass
 class MultiLayerSparseSteeringController:
     controllers: List[SparseSteeringController]
+    _handles: List = None  # hook handles, populated by register()
 
     @classmethod
     def from_artifact(
@@ -120,5 +141,18 @@ class MultiLayerSparseSteeringController:
         ]
         return cls(controllers=controllers)
 
-    def register(self, pipe):
-        return [attach_controller(pipe, controller) for controller in self.controllers]
+    def register(self, pipe) -> "MultiLayerSparseSteeringController":
+        self._handles = [attach_controller(pipe, ctrl) for ctrl in self.controllers]
+        return self
+
+    def set_enabled(self, enabled: bool) -> None:
+        """Toggle steering on/off for all layers (used for timestep scheduling)."""
+        for ctrl in self.controllers:
+            ctrl.enabled = enabled
+
+    def remove(self) -> None:
+        """Remove all forward hooks from the model."""
+        if self._handles:
+            for h in self._handles:
+                h.remove()
+            self._handles = []
