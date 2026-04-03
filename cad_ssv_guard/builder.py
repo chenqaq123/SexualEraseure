@@ -4,23 +4,30 @@ Orchestrates the full CAD + SSV pipeline:
 
 1. **CAD localisation** — gradient attribution identifies which FFN layers and
    channels respond most strongly to the target concept.
-2. **SSV scoring** — activation statistics (positive minus negative mean)
+2. **Layer prior weighting** — architecture-aware Gaussian prior favors
+   mid-depth "semantic encoding" layers, avoiding early (layout) and late
+   (detail) layers.
+3. **SSV scoring** — activation statistics (positive minus negative mean)
    further filter channels that are both concept-sensitive *and* have
    meaningful activation differences.
-3. **Artifact assembly** — the top-ranked channels and their steering vectors
+4. **Artifact assembly** — the top-ranked channels and their steering vectors
    are packed into a :class:`~cad_ssv_guard.artifact.GuardArtifact`.
 """
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import torch
 
 from .artifact import GuardArtifact, GuardLayer
 from .backend import ModelBackend
-from .cad import compute_nudity_cad_scores
+from .cad import CADLayerScores, compute_nudity_cad_scores
 from .ssv import collect_mean_activation, compute_ssv_scores, normalize_nonnegative
+from .layer_prior import (
+    compute_layer_prior_weights,
+    apply_prior_to_scores,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -97,15 +104,18 @@ def build_nudity_guard(
     seed: int = 0,
     height: Optional[int] = None,
     width: Optional[int] = None,
+    use_layer_prior: bool = True,
+    prior_strength: float = 1.0,
+    cad_devices: Optional[Sequence[torch.device]] = None,
 ) -> GuardArtifact:
-    """Build a concept-erasing guard artifact for SD1, SD3, or FLUX.
+    """Build a concept-erasing guard artifact for SD1, SD3, FLUX, CogVideoX, HunyuanVideo.
 
     Parameters
     ----------
     pipe:
         Loaded diffusers pipeline.
     backend:
-        Model-specific backend (``get_backend("sd1" | "sd3" | "flux")``).
+        Model-specific backend (``get_backend("sd1" | "sd3" | "flux" | "cogvideox" | "hunyuanvideo")``).
     positive_prompts:
         Prompts describing the concept to suppress (e.g. nudity).
     negative_prompts:
@@ -142,6 +152,11 @@ def build_nudity_guard(
         Base random seed.
     height / width:
         Resolution used for CAD attribution.
+    use_layer_prior:
+        If True, apply architecture-aware Gaussian prior to layer scores,
+        favoring mid-depth "semantic encoding" layers.
+    prior_strength:
+        Strength of the layer prior (0.0 = pure data-driven, 1.0 = full prior).
 
     Returns
     -------
@@ -166,16 +181,49 @@ def build_nudity_guard(
         seed=seed,
         height=height,
         width=width,
+        devices=cad_devices,
     )
 
     backbone = backend.get_backbone(pipe)
     module_lookup = dict(backbone.named_modules())
 
-    ranked_layers = sorted(
-        layer_scores.values(),
-        key=lambda x: x.layer_score,
-        reverse=True,
-    )
+    # Apply architecture-aware layer prior to favor semantic encoding layers
+    if use_layer_prior:
+        layer_names = [ls.spec.ff_name for ls in layer_scores.values()]
+        prior_weights = compute_layer_prior_weights(
+            layer_names=layer_names,
+            model_type=backend.model_type,
+        )
+        raw_scores = {
+            ls.spec.ff_name: ls.layer_score
+            for ls in layer_scores.values()
+        }
+        adjusted_scores = apply_prior_to_scores(
+            layer_scores=raw_scores,
+            prior_weights=prior_weights,
+            prior_strength=prior_strength,
+        )
+        # Create copies of CADLayerScores with adjusted scores for ranking
+        adjusted_layer_scores = []
+        for ls in layer_scores.values():
+            adjusted_ls = CADLayerScores(
+                spec=ls.spec,
+                channel_scores=ls.channel_scores,
+                raw_channel_scores=ls.raw_channel_scores,
+                layer_score=adjusted_scores.get(ls.spec.ff_name, ls.layer_score),
+            )
+            adjusted_layer_scores.append(adjusted_ls)
+        ranked_layers = sorted(
+            adjusted_layer_scores,
+            key=lambda x: x.layer_score,
+            reverse=True,
+        )
+    else:
+        ranked_layers = sorted(
+            layer_scores.values(),
+            key=lambda x: x.layer_score,
+            reverse=True,
+        )
     ranked_layers = ranked_layers[: min(num_layers, len(ranked_layers))]
 
     if total_steering_channels is None:
@@ -188,6 +236,10 @@ def build_nudity_guard(
     )
 
     # ── Step 2 : SSV — collect activation statistics and build steering vectors
+    # For video models, use reduced frame count during SSV collection
+    is_video = hasattr(backend, "cad_num_frames")
+    ssv_num_frames = getattr(backend, "cad_num_frames", None) if is_video else None
+
     guard_layers: List[GuardLayer] = []
     for layer_idx, (layer, layer_budget) in enumerate(zip(ranked_layers, budgets)):
         hidden_module = module_lookup[layer.spec.hidden_module_name]
@@ -199,6 +251,7 @@ def build_nudity_guard(
             num_inference_steps=num_inference_steps,
             guidance_scale=guidance_scale,
             seed=seed,
+            num_frames=ssv_num_frames,
         )
         negative_stats = collect_mean_activation(
             pipe=pipe,
@@ -207,6 +260,7 @@ def build_nudity_guard(
             num_inference_steps=num_inference_steps,
             guidance_scale=guidance_scale,
             seed=seed + 10_000 + layer_idx * 1_000,
+            num_frames=ssv_num_frames,
         )
 
         # Combine CAD and SSV scores: prefer channels that are *both*
@@ -261,5 +315,7 @@ def build_nudity_guard(
             "layer_budgets": budgets,
             "cad_layer_score_type": "normalized_topk_mean",
             "cad_channel_normalization": "raw_score / mean_abs_weight_column",
+            "use_layer_prior": use_layer_prior,
+            "prior_strength": prior_strength,
         },
     )

@@ -7,3 +7,7 @@ refs/
 eval_outputs/
 artifacts/
 .DS_Store/
+papers/
+outputs/
+.claude/
+.qoder/

@@ -5,6 +5,8 @@ Each backend encapsulates the differences between:
   - SD3  : MMDiT transformer, triple encoder (CLIP-L/G + T5), standard CFG
   - FLUX : DiT transformer, dual encoder (CLIP-L + T5), guidance distillation
             — NO standard CFG, so CAD requires two separate forward passes.
+  - CogVideoX  : 3D DiT, T5-XXL text encoder, DPM-Multistep scheduler, standard CFG
+  - HunyuanVideo : Dual-stream DiT, LLAMA + CLIP encoders, flow-matching
 
 The rest of the pipeline (FFN discovery, SSV statistics, steering hooks) is
 model-agnostic and shared across all backends.
@@ -488,10 +490,17 @@ class FluxBackend(ModelBackend):
 # Registry
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Lazy import to avoid circular dependency: video_backend needs ModelBackend
+# which is defined above, but backend.py needs CogVideoXBackend/HunyuanVideoBackend
+# for the registry. Importing here (after ModelBackend is fully defined) breaks the cycle.
+from .video_backend import CogVideoXBackend, HunyuanVideoBackend
+
 _REGISTRY: Dict[str, ModelBackend] = {
     "sd1": SD1Backend(),
     "sd3": SD3Backend(),
     "flux": FluxBackend(),
+    "cogvideox": CogVideoXBackend(),
+    "hunyuanvideo": HunyuanVideoBackend(),
 }
 
 

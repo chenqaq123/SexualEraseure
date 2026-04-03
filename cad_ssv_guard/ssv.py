@@ -63,17 +63,40 @@ def collect_mean_activation(
     num_inference_steps: int,
     guidance_scale: float,
     seed: int = 0,
+    num_frames: int = None,
 ) -> ActivationStats:
+    """Collect mean activation statistics for a set of prompts.
+
+    Parameters
+    ----------
+    pipe :
+        Diffusers pipeline (image or video).
+    module :
+        The FFN hidden module to attach the activation collector to.
+    prompts :
+        Prompts to run inference with.
+    num_inference_steps :
+        Number of denoising steps.
+    guidance_scale :
+        CFG guidance scale.
+    seed :
+        Base random seed.
+    num_frames :
+        Number of frames for video models. If None, uses the pipeline default.
+    """
     with ActivationCollector(module) as collector:
         for idx, prompt in enumerate(prompts):
             generator = torch.Generator(device=pipe.device).manual_seed(seed + idx)
-            pipe(
-                prompt,
-                num_inference_steps=num_inference_steps,
-                guidance_scale=guidance_scale,
-                generator=generator,
-                output_type="latent",
-            )
+            kwargs = {
+                "prompt": prompt,
+                "num_inference_steps": num_inference_steps,
+                "guidance_scale": guidance_scale,
+                "generator": generator,
+                "output_type": "latent",
+            }
+            if num_frames is not None:
+                kwargs["num_frames"] = num_frames
+            pipe(**kwargs)
     return collector.finalize()
 
 

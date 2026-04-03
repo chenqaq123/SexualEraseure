@@ -96,8 +96,8 @@ _HARMFUL_LABELS = {
 def _common_args(p: argparse.ArgumentParser) -> None:
     """Arguments shared by all sub-commands."""
     p.add_argument(
-        "--model_type", required=True, choices=["sd1", "sd3", "flux"],
-        help="Model family: sd1 (SD 1.x), sd3 (SD 3.x), flux (FLUX.1-dev/schnell).",
+        "--model_type", required=True, choices=["sd1", "sd3", "flux", "cogvideox", "hunyuanvideo"],
+        help="Model family: sd1, sd3, flux, cogvideox, hunyuanvideo.",
     )
     p.add_argument(
         "--model_id", required=True,
@@ -173,6 +173,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_build.add_argument("--min_channels_per_layer", type=int, default=8)
     p_build.add_argument("--alpha", type=float, default=1.0,
                          help="Default steering strength stored in the artifact.")
+    p_build.add_argument("--use_layer_prior", action="store_true", default=True,
+                         help="Apply architecture-aware Gaussian prior to layer selection.")
+    p_build.add_argument("--no_layer_prior", action="store_true", default=False,
+                         help="Disable layer prior (pure data-driven selection).")
+    p_build.add_argument("--prior_strength", type=float, default=1.0,
+                         help="Strength of the layer prior (0.0=none, 1.0=full).")
 
     # ── generate ──────────────────────────────────────────────────────────────
     p_gen = sub.add_parser(
@@ -327,6 +333,8 @@ def run_build(args) -> None:
         seed=args.seed,
         height=height,
         width=width,
+        use_layer_prior=not getattr(args, "no_layer_prior", False),
+        prior_strength=args.prior_strength,
     )
 
     save_artifact(artifact, args.artifact)

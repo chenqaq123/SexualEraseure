@@ -93,23 +93,27 @@ class CogVideoXBackend(ModelBackend):
 
     def prepare_latents(self, pipe, height, width, device, dtype, generator):
         num_frames = self.cad_num_frames
-        # CogVideoX VAE temporal compression ratio
-        temporal_compress = getattr(pipe.vae.config, "temporal_compression_ratio", 4)
-        spatial_compress = pipe.vae_scale_factor
 
-        latent_frames = (num_frames - 1) // temporal_compress + 1
-        latent_h = height // spatial_compress
-        latent_w = width // spatial_compress
-        num_channels = pipe.transformer.config.in_channels
-
-        shape = (1, num_channels, latent_frames, latent_h, latent_w)
-        latents = torch.randn(shape, generator=generator, device=device, dtype=dtype)
+        # Use the pipeline's own prepare_latents to get correctly shaped latents.
+        # CogVideoXPipeline.prepare_latents returns (batch, channels, frames, h, w)
+        # with the correct VAE latent channel count (typically 16).
+        latents = pipe.prepare_latents(
+            batch_size=1,
+            num_channels_latents=pipe.vae.config.latent_channels,
+            num_frames=num_frames,
+            height=height,
+            width=width,
+            dtype=dtype,
+            device=device,
+            generator=generator,
+        )
+        # latents shape: (1, C_vae, F_lat, H_lat, W_lat)
         return {"latents": latents, "num_frames": num_frames}
 
     def cad_forward(self, pipe, latents_dict, text_dict, timestep):
         latents = latents_dict["latents"]
 
-        # CogVideoX transformer expects (B, C, F, H, W)
+        # CogVideoX transformer expects (B, C, F, H, W) with C = VAE latent channels (16).
         # Repeat latent for batch-2 [positive_cond, negative_cond]
         latent_input = latents.repeat(2, 1, 1, 1, 1)
 
@@ -249,17 +253,18 @@ class HunyuanVideoBackend(ModelBackend):
 
     def prepare_latents(self, pipe, height, width, device, dtype, generator):
         num_frames = self.cad_num_frames
-        # HunyuanVideo VAE compression ratios
-        temporal_compress = getattr(pipe.vae.config, "temporal_compression_ratio", 4)
-        spatial_compress = pipe.vae_scale_factor
 
-        latent_frames = (num_frames - 1) // temporal_compress + 1
-        latent_h = height // spatial_compress
-        latent_w = width // spatial_compress
-        num_channels = pipe.transformer.config.in_channels
-
-        shape = (1, num_channels, latent_frames, latent_h, latent_w)
-        latents = torch.randn(shape, generator=generator, device=device, dtype=dtype)
+        # Use the pipeline's own prepare_latents for correct latent shape.
+        latents = pipe.prepare_latents(
+            batch_size=1,
+            num_channels_latents=pipe.vae.config.latent_channels,
+            num_frames=num_frames,
+            height=height,
+            width=width,
+            dtype=dtype,
+            device=device,
+            generator=generator,
+        )
         return {"latents": latents, "num_frames": num_frames}
 
     def _transformer_call(
