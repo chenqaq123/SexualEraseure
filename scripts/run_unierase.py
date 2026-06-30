@@ -56,6 +56,7 @@ from cad_ssv_guard.weight_editor import (
     edit_ffn_weights,
     edit_multiple_layers,
     verify_edit,
+    print_verification,
 )
 from cad_ssv_guard.layer_prior import (
     compute_layer_prior_weights,
@@ -79,13 +80,14 @@ def run_phase12_build_guard(
     cad_num_samples: int = 4,
     use_layer_prior: bool = True,
     prior_strength: float = 1.0,
+    allowed_blocks=None,
     seed: int = 0,
     cad_devices=None,
+    ssv_num_seeds: int = 4,
+    pca_max_rank: int = 8,
+    pca_variance_threshold: float = 0.80,
 ) -> dict:
-    """Run Phase 1 (CAD layer attribution) and Phase 2 (SSV channel selection).
-
-    Returns the guard artifact data needed for Phase 3+4.
-    """
+    """Run Phase 1 (CAD) + Phase 2 (SSV per-sample) + PCA direction extraction."""
     artifact = build_nudity_guard(
         pipe=pipe,
         backend=backend,
@@ -96,8 +98,12 @@ def run_phase12_build_guard(
         cad_num_samples=cad_num_samples,
         use_layer_prior=use_layer_prior,
         prior_strength=prior_strength,
+        allowed_blocks=allowed_blocks,
         seed=seed,
         cad_devices=cad_devices,
+        ssv_num_seeds=ssv_num_seeds,
+        pca_max_rank=pca_max_rank,
+        pca_variance_threshold=pca_variance_threshold,
     )
     return artifact
 
@@ -152,7 +158,7 @@ def run_phase3_cpca(
             prompts=artifact.negative_prompts[:5],
             num_inference_steps=artifact.num_inference_steps,
             guidance_scale=artifact.guidance_scale,
-            seed=42 + 10000,
+            seed=42,
             num_frames=ssv_num_frames,
         )
 
@@ -163,7 +169,7 @@ def run_phase3_cpca(
             prompts=neutral_prompts[:10],
             num_inference_steps=artifact.num_inference_steps,
             guidance_scale=artifact.guidance_scale,
-            seed=42 + 20000,
+            seed=42,
             num_frames=ssv_num_frames,
         )
 
@@ -209,6 +215,7 @@ def run_phase4_weight_edit(
     artifact,
     cpca_results: List[CPCAResult],
     suppression_strength: float = 1.0,
+    use_aggressive_mode: bool = False,
 ) -> List[WeightEditResult]:
     """Run Phase 4: Closed-form weight update for each selected layer.
 
@@ -218,13 +225,10 @@ def run_phase4_weight_edit(
 
     edits = []
     for layer, cpca_result in zip(artifact.layers, cpca_results):
-        # Concept direction for weight editing: use the refined direction
-        # combined with the original steering direction
-        steering_vec = torch.tensor(layer.steering_vector, dtype=torch.float32)
-        refined_dir = cpca_result.refined_direction
-
-        # Blend: 50% original steering + 50% cPCA refined
-        concept_direction = (steering_vec + refined_dir)
+        # Use the cPCA refined direction as the concept direction for editing.
+        # The refined direction has already been contrastively filtered to
+        # isolate the target concept from unrelated semantics.
+        concept_direction = cpca_result.refined_direction.clone()
         concept_direction = concept_direction / (concept_direction.norm() + 1e-8)
 
         edits.append({
@@ -238,16 +242,13 @@ def run_phase4_weight_edit(
         backbone=backbone,
         layer_edits=edits,
         suppression_strength=suppression_strength,
+        use_aggressive_mode=use_aggressive_mode,
     )
 
     # Print verification
     for result in results:
         verification = verify_edit(backbone, result)
-        print(f"  Layer {result.layer_name}:")
-        print(f"    Channels modified: {len(result.channel_indices)}")
-        print(f"    Weight delta norm: {result.weight_delta_norm:.4f}")
-        print(f"    Suppression ratio: {verification['suppression_ratio']:.6f}")
-        print(f"    Weight change ratio: {verification['weight_change_ratio']:.6f}")
+        print_verification(result, verification)
 
     return results
 
@@ -380,8 +381,22 @@ def main() -> None:
     parser.add_argument("--cad_num_samples", type=int, default=4)
     parser.add_argument("--use_layer_prior", action="store_true", default=True)
     parser.add_argument("--prior_strength", type=float, default=1.0)
+    parser.add_argument("--allowed_blocks", type=str, nargs="+", default=None,
+                        help="Hard constraint: only consider layers whose ff_name starts with "
+                             "one of these prefixes, e.g. --allowed_blocks mid_block up_blocks.1 up_blocks.2")
+    # SSV per-sample collection (feeds PCA)
+    parser.add_argument("--ssv_num_seeds", type=int, default=4,
+                        help="Number of random seeds for per-sample activation collection. "
+                             "More seeds → larger PCA diff matrix → more stable directions.")
+    # PCA rank selection
+    parser.add_argument("--pca_max_rank", type=int, default=8,
+                        help="Hard upper bound on PCA directions per layer.")
+    parser.add_argument("--pca_variance_threshold", type=float, default=0.80,
+                        help="Cumulative explained-variance threshold for elbow rank selection.")
 
     # Phase 3 params
+    parser.add_argument("--skip_cpca", action="store_true", default=False,
+                        help="Skip Phase 3 cPCA refinement; use PCA directions directly")
     parser.add_argument("--cpca_alpha", type=float, default=1.0,
                         help="cPCA contrastive strength")
     parser.add_argument("--cpca_rank", type=int, default=5,
@@ -389,7 +404,9 @@ def main() -> None:
 
     # Phase 4 params
     parser.add_argument("--suppression_strength", type=float, default=1.0,
-                        help="Lambda for weight update (1.0 = full suppression)")
+                        help="Lambda for weight update (1.0 = full suppression, >1.0 = aggressive inversion)")
+    parser.add_argument("--aggressive_mode", action="store_true", default=False,
+                        help="Enable aggressive suppression mode (stronger erasure)")
 
     # Prompts
     parser.add_argument("--positive_prompts", type=str,
@@ -463,8 +480,12 @@ def main() -> None:
         cad_num_samples=args.cad_num_samples,
         use_layer_prior=args.use_layer_prior,
         prior_strength=args.prior_strength,
+        allowed_blocks=args.allowed_blocks,
         seed=args.seed,
         cad_devices=cad_devices,
+        ssv_num_seeds=args.ssv_num_seeds,
+        pca_max_rank=args.pca_max_rank,
+        pca_variance_threshold=args.pca_variance_threshold,
     )
     print(f"Selected {len(artifact.layers)} layers:")
     for layer in artifact.layers:
@@ -476,29 +497,68 @@ def main() -> None:
     save_artifact(artifact, artifact_path)
     print(f"\nSaved guard artifact to {artifact_path}")
 
-    # Phase 3: cPCA refinement
-    print("\n" + "=" * 60)
-    print("Phase 3: cPCA concept direction refinement")
-    print("=" * 60)
-    cpca_results = run_phase3_cpca(
-        pipe=pipe,
-        backend=backend,
-        artifact=artifact,
-        neutral_prompts=neutral_prompts,
-        cpca_alpha=args.cpca_alpha,
-        cpca_rank=args.cpca_rank,
-    )
+    # Phase 3: cPCA refinement (optional)
+    if args.skip_cpca:
+        print("\n" + "=" * 60)
+        print("Phase 3: SKIPPED (using raw steering vectors)")
+        print("=" * 60)
+        cpca_results = None
+    else:
+        print("\n" + "=" * 60)
+        print("Phase 3: cPCA concept direction refinement")
+        print("=" * 60)
+        cpca_results = run_phase3_cpca(
+            pipe=pipe,
+            backend=backend,
+            artifact=artifact,
+            neutral_prompts=neutral_prompts,
+            cpca_alpha=args.cpca_alpha,
+            cpca_rank=args.cpca_rank,
+        )
 
     # Phase 4: Weight editing
     print("\n" + "=" * 60)
     print("Phase 4: Closed-form weight update (PERMANENT)")
     print("=" * 60)
-    edit_results = run_phase4_weight_edit(
-        pipe=pipe,
-        backend=backend,
-        artifact=artifact,
-        cpca_results=cpca_results,
+
+    # Build per-layer edits using rank-d PCA directions from artifact
+    edits = []
+    for layer in artifact.layers:
+        if layer.concept_directions is not None:
+            # Rank-d directions from PCA (shape: d × k)
+            dirs = torch.tensor(layer.concept_directions, dtype=torch.float32)
+        else:
+            # Fallback: single steering vector (legacy artifacts)
+            dirs = torch.tensor(layer.steering_vector, dtype=torch.float32).unsqueeze(0)
+
+        # Normalise rows (unit norm)
+        norms = dirs.norm(dim=1, keepdim=True).clamp_min(1e-8)
+        dirs = dirs / norms
+
+        evr = layer.pca_explained_variance_ratios or [1.0]
+        print(f"  {layer.ff_name}: {dirs.shape[0]} PCA directions, "
+              f"EVR={[f'{v:.1%}' for v in evr]}")
+
+        edits.append({
+            "projection_module_name": layer.projection_module_name,
+            "channel_indices": layer.selected_channels,
+            "concept_directions": dirs,
+            "cpca_result": None,
+        })
+
+    # If cPCA results available (Phase 3 not skipped), override primary direction
+    if cpca_results is not None:
+        for edit, cpca_result in zip(edits, cpca_results):
+            refined = cpca_result.refined_direction
+            refined = refined / (refined.norm() + 1e-8)
+            # Replace only the first direction with the refined one
+            edit["concept_directions"][0] = refined
+
+    edit_results = edit_multiple_layers(
+        backbone=backend.get_backbone(pipe),
+        layer_edits=edits,
         suppression_strength=args.suppression_strength,
+        use_aggressive_mode=args.aggressive_mode,
     )
 
     # Save weight edit summary
@@ -512,11 +572,18 @@ def main() -> None:
     for result in edit_results:
         verification = verify_edit(backend.get_backbone(pipe), result)
         edit_summary["layers"].append({
-            "layer_name": result.layer_name,
-            "channels_modified": len(result.channel_indices),
-            "weight_delta_norm": result.weight_delta_norm,
-            "suppression_ratio": verification["suppression_ratio"],
-            "weight_change_ratio": verification["weight_change_ratio"],
+            "layer_name":                  result.layer_name,
+            "channels_modified":           len(result.channel_indices),
+            "suppression_strength":        result.suppression_strength,
+            "use_aggressive_mode":         result.use_aggressive_mode,
+            # ── Core suppression metrics ──────────────────────────────────
+            "concept_response_before":     verification["concept_response_before"],
+            "concept_response_after":      verification["concept_response_after"],
+            "suppression_factor":          verification["suppression_factor"],
+            "direction_cosine":            verification["direction_cosine"],
+            # ── Weight perturbation ───────────────────────────────────────
+            "weight_delta_norm":           result.weight_delta_norm,
+            "weight_change_ratio":         verification["weight_change_ratio"],
         })
 
     summary_path = output_dir / "edit_summary.json"

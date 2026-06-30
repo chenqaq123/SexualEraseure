@@ -17,6 +17,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
+from tqdm import tqdm
 
 from .backend import ModelBackend
 from .ffn import (
@@ -95,7 +96,7 @@ def _run_single_sample_attribution(
         pipe, height, width, device, dtype, generator
     )
 
-    for timestep in pipe.scheduler.timesteps:
+    for timestep in tqdm(pipe.scheduler.timesteps, desc=f"  Sample seed={sample_seed}", leave=False):
         noise_pred_pos, noise_pred_neg = backend.cad_forward(
             pipe, latents_dict, text_dict, timestep
         )
@@ -114,9 +115,18 @@ def _run_single_sample_attribution(
             grad = weight.grad
             if grad is None:
                 continue
-            attribution = (
-                weight.detach().float() * grad.detach().float()
-            ).clamp_min(0.0)
+            # Keep signed attribution: positive channels amplify concept,
+            # negative channels suppress it. Both are useful for erasure.
+            #
+            # Normalise by the gradient Frobenius norm so that the accumulated
+            # score reflects the *alignment* between the weight direction and the
+            # gradient direction rather than the raw gradient magnitude.
+            # Without this, layers with inherently larger gradient scales
+            # (e.g. early context-stream FFNs in SD3 MM-DiT) dominate the
+            # layer_score regardless of their true causal relevance.
+            grad_f = grad.detach().float()
+            grad_norm = grad_f.norm().clamp_min(1e-8)
+            attribution = weight.detach().float() * grad_f / grad_norm
             local_buffers[ff_name] += attribution.sum(dim=0)
 
         with torch.no_grad():
@@ -237,7 +247,13 @@ def compute_nudity_cad_scores(
         for ff_name, weight in tracked_weights.items()
     }
 
-    for pos_prompt, neg_prompt, sample_seed in work_items:
+    total_items = len(work_items)
+    print(f"\n[CAD] Starting attribution: {total_items} samples × {num_steps} steps = {total_items * num_steps} total steps")
+    print(f"[CAD] {len(ffn_specs)} FFN layers discovered")
+
+    for item_idx, (pos_prompt, neg_prompt, sample_seed) in enumerate(
+        tqdm(work_items, desc="CAD samples", total=total_items), 1
+    ):
         local = _run_single_sample_attribution(
             pipe=pipe,
             backend=backend,
@@ -263,7 +279,7 @@ def compute_nudity_cad_scores(
         channel_scores = (raw_scores / column_scale).cpu()
 
         topk = min(layer_topk, channel_scores.numel())
-        layer_score = float(torch.topk(channel_scores, k=topk).values.mean().item())
+        layer_score = float(torch.topk(channel_scores.abs(), k=topk).values.abs().mean().item())
 
         results[ff_name] = CADLayerScores(
             spec=spec,
@@ -271,6 +287,21 @@ def compute_nudity_cad_scores(
             raw_channel_scores=raw_scores.cpu(),
             layer_score=layer_score,
         )
+
+    # Normalize layer scores across all layers so they are comparable.
+    # Each layer's raw_score/weight_scale has different absolute scale,
+    # so we divide by the per-layer max to get a relative score in [0, 1].
+    all_scores = torch.tensor([r.layer_score for r in results.values()], dtype=torch.float32)
+    max_score = all_scores.max().item()
+    if max_score > 0:
+        for name in results:
+            results[name] = CADLayerScores(
+                spec=results[name].spec,
+                channel_scores=results[name].channel_scores,
+                raw_channel_scores=results[name].raw_channel_scores,
+                layer_score=results[name].layer_score / max_score,
+            )
+
     return results
 
 
@@ -462,7 +493,7 @@ def _compute_nudity_cad_scores_multi_gpu(
         channel_scores = raw_scores / column_scale
 
         topk = min(layer_topk, channel_scores.numel())
-        layer_score = float(torch.topk(channel_scores, k=topk).values.mean().item())
+        layer_score = float(torch.topk(channel_scores.abs(), k=topk).values.abs().mean().item())
 
         results[ff_name] = CADLayerScores(
             spec=spec,
@@ -470,6 +501,19 @@ def _compute_nudity_cad_scores_multi_gpu(
             raw_channel_scores=raw_scores,
             layer_score=layer_score,
         )
+
+    # Cross-layer normalization
+    all_scores = torch.tensor([r.layer_score for r in results.values()], dtype=torch.float32)
+    max_score = all_scores.max().item()
+    if max_score > 0:
+        for name in results:
+            results[name] = CADLayerScores(
+                spec=results[name].spec,
+                channel_scores=results[name].channel_scores,
+                raw_channel_scores=results[name].raw_channel_scores,
+                layer_score=results[name].layer_score / max_score,
+            )
+
     return results
 
 

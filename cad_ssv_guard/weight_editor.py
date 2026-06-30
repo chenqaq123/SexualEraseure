@@ -1,28 +1,34 @@
 """Closed-form sparse weight editing for permanent concept erasure.
 
-This module implements the core innovation of UniErase: converting
-inference-time activation steering into permanent weight modifications.
+Mathematical derivation
+-----------------------
+FFN structure:
+    h(x) = Activate(x W_1 + b_1)    [post-activation hidden, shape (d_ff,)]
+    y(x) = h(x) W_2 + b_2           [output projection]
 
-Mathematical derivation:
-    FFN structure:  h(x) = Activate(x W_1 + b_1)   [post-activation, sparse]
-                    y(x) = h(x) W_2 + b_2           [output]
+**Rank-1 edit** (original SSV-Guard / UniErase):
+    We want to erase one concept direction r ∈ R^k (k = |selected channels|).
+    The update matrix is:
+        M₁ = I - λ · (r rᵀ) / ‖r‖²
+    Applied to W_2:
+        W_new[:, idx] = W_old[:, idx] @ M₁
+    Effect on concept-aligned activation:
+        W_new @ r = (1 - λ) · W_old @ r
+        λ = 1 → W_new @ r = 0   (complete nullification)
+        λ = 2 → W_new @ r = -W_old @ r  (Householder reflection / inversion)
 
-    SSV-Guard steers activations at inference time:
-        h'[C_top] = h[C_top] - alpha * gamma * v_top
-        where gamma = cos(h[C_top], v_top)
+**Rank-d edit** (PCA-based, this module):
+    Given d orthonormal concept directions R = [r₁, …, r_d] (rows, from SVD),
+    apply successive rank-1 projections:
+        M = M_d @ … @ M_1    where  M_i = I - λ · r_i rᵢᵀ / ‖r_i‖²
+    Because the r_i are orthonormal, the combined effect is:
+        M = I - λ · Rᵀ R    (projection onto the orthogonal complement of span{R})
+    This completely removes the k-dimensional concept subspace from W_2
+    when λ = 1, regardless of how many directions d ≤ k there are.
 
-    We prove this is equivalent to a left-side projection on W_2:
-        W_2_new[C_top, :] = (I_k - lambda * P_rho * r_hat * r_hat^T * P_rho
-                             / (r_hat^T * P_rho * r_hat)) @ W_2[C_top, :]
-
-    For concept-aligned input:   r_hat^T @ W_2_new[C_top, :] ≈ 0  (suppressed)
-    For unrelated input h ⊥ r:   h^T @ W_2_new[C_top, :] = h^T @ W_2[C_top, :]  (preserved)
-
-    This update is:
-    - Permanent: baked into weights, survives model distribution
-    - Precise: only affects concept-relevant channel rows of W_2
-    - Zero-overhead: no inference-time computation added
-    - Non-reversible: cannot be undone by removing inference hooks
+Verification metric (primary direction):
+    suppression_factor = ‖W_new @ r₁‖ / ‖W_old @ r₁‖  = |1 - λ|
+    direction_cosine   = cosine(W_old @ r₁, W_new @ r₁) = sign(1 - λ)
 
 References:
     - LRR-V (ICLR'26) Eq. 8: closed-form weight update via refusal vectors
@@ -33,7 +39,7 @@ References:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -41,121 +47,141 @@ import torch.nn as nn
 from .cpca import CPCAResult
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Result dataclass
+# ─────────────────────────────────────────────────────────────────────────────
+
 @dataclass
 class WeightEditResult:
-    """Result of a weight edit operation on one FFN layer.
+    """Result of a rank-d weight edit operation on one FFN layer.
 
     Attributes
     ----------
     layer_name : str
-        Name of the edited FFN layer (e.g., "up_blocks.1.attentions.0.ff").
+        Human-readable layer name.
     projection_module_name : str
-        Name of the W_2 projection module that was modified.
+        Full path of the edited nn.Linear (W_2).
     channel_indices : List[int]
-        Indices of the modified channel rows in W_2.
+        Edited column indices of W_2 (= selected hidden channels).
     concept_direction : torch.Tensor
-        The refined concept direction used for the edit.
+        Primary concept direction (first PCA component), shape (k,).
+        Used for verification metrics.
+    num_directions : int
+        Total number of PCA directions used in the rank-d edit.
     weight_delta_norm : float
-        Frobenius norm of the weight change (for monitoring).
+        ‖W_new − W_old‖_F.
     original_weight_norm : float
-        Frobenius norm of the original W_2 sub-matrix.
+        ‖W_old[:, idx]‖_F.
+    original_concept_response_norm : float
+        ‖W_old[:, idx] @ r₁‖  (primary direction, before edit).
+    edited_concept_response_norm : float
+        ‖W_new[:, idx] @ r₁‖  (primary direction, after edit).
+        Theoretically |1 − λ| × original_concept_response_norm.
+    direction_cosine : float
+        cos(W_old @ r₁, W_new @ r₁):
+          +1  same direction  (λ < 1)
+           0  orthogonal      (λ = 1, fully suppressed)
+          -1  inverted        (λ > 1)
+    suppression_strength : float
+        λ value used.
+    use_aggressive_mode : bool
+        Whether λ > 1 was allowed.
     """
     layer_name: str
     projection_module_name: str
     channel_indices: List[int]
-    concept_direction: torch.Tensor
+    concept_direction: torch.Tensor      # primary direction (k,)
+    num_directions: int
     weight_delta_norm: float
     original_weight_norm: float
+    original_concept_response_norm: float
+    edited_concept_response_norm: float
+    direction_cosine: float
+    suppression_strength: float
+    use_aggressive_mode: bool
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Update matrix
+# ─────────────────────────────────────────────────────────────────────────────
 
 def compute_weight_update_matrix(
-    concept_direction: torch.Tensor,
-    cpca_result: Optional[CPCAResult] = None,
+    concept_directions: torch.Tensor,
     suppression_strength: float = 1.0,
+    use_aggressive_mode: bool = False,
 ) -> torch.Tensor:
-    """Compute the left-multiplication matrix for weight editing.
+    """Compute the rank-d left-multiplication matrix for weight editing.
 
     Parameters
     ----------
-    concept_direction : torch.Tensor
-        Refined concept direction in channel space, shape (k,).
-    cpca_result : CPCAResult, optional
-        If provided, uses the cPCA projection matrix for more precise
-        concept isolation.  If None, uses direct projection.
+    concept_directions : Tensor of shape (d, k) or (k,)
+        PCA concept directions (rows).  For a single direction pass a 1-D
+        tensor; it will be promoted to (1, k) internally.
+        Rows are assumed to be unit-norm and mutually orthogonal (as produced
+        by SVD / ``_pca_concept_directions`` in builder.py).
     suppression_strength : float
-        Lambda parameter controlling suppression magnitude.
-        1.0 = full suppression; < 1.0 = partial suppression.
+        λ — controls suppression magnitude per direction:
+        λ = 1 → nullify (W_new @ r = 0)
+        λ = 2 → Householder reflection (W_new @ r = −W_old @ r)
+        λ < 1 → partial suppression
+    use_aggressive_mode : bool
+        When False, λ is clipped to max 1.0 (clean nullification).
+        When True, λ > 1 is allowed (concept direction inverted).
 
     Returns
     -------
-    Tensor of shape (k, k): the matrix M such that W_2_new = M @ W_2_old.
+    M : Tensor (k, k) such that W_new[:, idx] = W_old[:, idx] @ M.
     """
-    r = concept_direction.float()
-    k = r.shape[0]
+    R = concept_directions.float()
+    if R.ndim == 1:
+        R = R.unsqueeze(0)              # (1, k)
 
-    if cpca_result is not None and cpca_result.projection_matrix is not None:
-        P = cpca_result.projection_matrix.float()  # (k, k)
-        # Projected direction
-        Pr = P @ r
-        denominator = r @ Pr
-        if denominator.abs() < 1e-10:
-            return torch.eye(k, dtype=r.dtype, device=r.device)
-        # M = I - lambda * (P r r^T P) / (r^T P r)
-        update = suppression_strength * torch.outer(Pr, Pr) / denominator
-    else:
-        # Direct projection without cPCA subspace
-        norm_sq = r @ r
-        if norm_sq.abs() < 1e-10:
-            return torch.eye(k, dtype=r.dtype, device=r.device)
-        # M = I - lambda * (r r^T) / (r^T r)
-        update = suppression_strength * torch.outer(r, r) / norm_sq
+    k = R.shape[1]
+    lam = suppression_strength if use_aggressive_mode else min(suppression_strength, 1.0)
 
-    M = torch.eye(k, dtype=r.dtype, device=r.device) - update
-    return M
+    M = torch.eye(k, dtype=R.dtype, device=R.device)
+    for r in R:
+        norm_sq = (r @ r).item()
+        if norm_sq < 1e-10:
+            continue
+        # M_i = I - λ · r rᵀ / ‖r‖²
+        M = M @ (torch.eye(k, dtype=R.dtype, device=R.device)
+                 - lam * torch.outer(r, r) / norm_sq)
 
+    return M                            # (k, k)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-layer edit
+# ─────────────────────────────────────────────────────────────────────────────
 
 def edit_ffn_weights(
     backbone: nn.Module,
     projection_module_name: str,
     channel_indices: List[int],
-    concept_direction: torch.Tensor,
-    cpca_result: Optional[CPCAResult] = None,
+    concept_directions: torch.Tensor,   # (d, k) or (k,)
     suppression_strength: float = 1.0,
+    use_aggressive_mode: bool = False,
+    # kept for API compatibility; no longer used internally
+    cpca_result: Optional[CPCAResult] = None,
 ) -> WeightEditResult:
-    """Apply closed-form weight edit to one FFN layer's W_2 projection.
+    """Apply rank-d closed-form weight edit to one FFN layer's W_2.
 
-    This modifies W_2[channel_indices, :] in-place, permanently removing
-    the concept direction from the weight matrix's row subspace.
+    Modifies ``W_2[:, channel_indices]`` in-place.
 
     Parameters
     ----------
-    backbone : nn.Module
-        The denoising backbone (UNet or Transformer).
-    projection_module_name : str
-        Full name of the W_2 linear module (e.g.,
-        ``"up_blocks.1.attentions.0.ff.net.2"``).
-    channel_indices : list of int
-        Row indices of W_2 corresponding to concept-relevant channels.
-    concept_direction : torch.Tensor
-        Refined concept direction in the channel subspace, shape (k,).
-    cpca_result : CPCAResult, optional
-        cPCA result for subspace-constrained editing.
-    suppression_strength : float
-        Controls how strongly the concept is suppressed (0=none, 1=full).
-
-    Returns
-    -------
-    WeightEditResult with edit metadata.
+    concept_directions : Tensor (d, k) or (k,)
+        PCA concept directions for the selected channel subspace.
+        Pass a 2-D tensor from builder.py's PCA output.
     """
-    # Look up the projection module
     module_lookup = dict(backbone.named_modules())
     if projection_module_name not in module_lookup:
         raise KeyError(
             f"Module {projection_module_name!r} not found in backbone. "
-            f"Available modules with 'ff': "
+            f"Modules containing 'ff': "
             f"{[n for n in module_lookup if 'ff' in n][:10]}"
         )
-
     proj_module = module_lookup[projection_module_name]
     if not isinstance(proj_module, nn.Linear):
         raise TypeError(
@@ -163,73 +189,105 @@ def edit_ffn_weights(
             f"for {projection_module_name}"
         )
 
-    # W_2 shape: (d_out, d_ff) for nn.Linear — note the transposition!
-    # nn.Linear stores weight as (out_features, in_features)
-    # so W_2[i, :] = weight[:, i] in the stored tensor
-    # We operate on the input dimension (in_features = d_ff)
-    weight = proj_module.weight.data  # (d_out, d_ff)
+    # nn.Linear: weight shape = (out_features, in_features)
+    # "channels" are along the in_features (d_ff) dimension
+    weight = proj_module.weight.data                      # (d_out, d_ff)
     idx = torch.tensor(channel_indices, dtype=torch.long, device=weight.device)
 
-    # Extract the sub-matrix: rows in channel space = columns of weight
-    # W_2_sub shape: (d_out, k) — these are the columns we want to modify
-    W_2_sub = weight[:, idx].clone().float()  # (d_out, k)
+    # Normalise and promote concept_directions to (d, k)
+    R = concept_directions.float().to(weight.device)
+    if R.ndim == 1:
+        R = R.unsqueeze(0)                                # (1, k)
+    norms = R.norm(dim=1, keepdim=True).clamp_min(1e-8)
+    R = R / norms                                         # unit-norm rows
+
+    primary_r = R[0]                                      # primary direction (k,)
+    num_directions = R.shape[0]
+
+    # Extract W_2 sub-matrix: columns = selected channels
+    W_2_sub = weight[:, idx].clone().float()              # (d_out, k)
     original_norm = W_2_sub.norm().item()
 
-    # Compute update matrix M: shape (k, k)
+    # ── Measure concept response BEFORE edit (primary direction) ──────────────
+    orig_response = W_2_sub @ primary_r                   # (d_out,)
+    original_concept_response_norm = orig_response.norm().item()
+
+    # ── Compute and apply rank-d update matrix ────────────────────────────────
     M = compute_weight_update_matrix(
-        concept_direction=concept_direction,
-        cpca_result=cpca_result,
+        concept_directions=R,
         suppression_strength=suppression_strength,
-    ).to(weight.device)
+        use_aggressive_mode=use_aggressive_mode,
+    )                                                      # (k, k)
 
-    # Apply: W_2_new_sub = W_2_sub @ M^T
-    # Because W_2_sub is (d_out, k) and M operates on the k-dim (input side):
-    # For each output neuron j:  new_w_j = M @ old_w_j  (where w_j ∈ R^k)
-    # In matrix form:  W_2_new_sub^T = M @ W_2_sub^T
-    #                  W_2_new_sub = (M @ W_2_sub^T)^T = W_2_sub @ M^T
-    W_2_new_sub = W_2_sub @ M.T
+    W_2_new_sub = W_2_sub @ M.T                           # M is symmetric → M.T = M
 
-    # Compute delta norm
+    # ── Measure concept response AFTER edit (primary direction) ───────────────
+    new_response = W_2_new_sub @ primary_r                # (d_out,)
+    edited_concept_response_norm = new_response.norm().item()
+
+    # Direction cosine (primary direction only)
+    if original_concept_response_norm > 1e-10 and edited_concept_response_norm > 1e-10:
+        direction_cosine = float(
+            (orig_response @ new_response)
+            / (original_concept_response_norm * edited_concept_response_norm)
+        )
+    else:
+        direction_cosine = 0.0
+
+    # ── Write back ────────────────────────────────────────────────────────────
     delta_norm = (W_2_new_sub - W_2_sub).norm().item()
 
-    # Write back in the original dtype
+    # Direct scatter assignment: weight[:, idx] = ... is an in-place scatter
+    # operation that modifies the original tensor.
+    # NOTE: weight[:, idx] with a tensor index returns a COPY (advanced indexing),
+    # so weight_col_sub = weight[:, idx]; weight_col_sub.copy_(...) would NOT
+    # write back to the original weight — never use that pattern here.
     weight[:, idx] = W_2_new_sub.to(weight.dtype)
 
-    return WeightEditResult(
-        layer_name=projection_module_name.rsplit(".net.", 1)[0]
+    # Verify write
+    verify_read = weight[:, idx].float()
+    write_error = (verify_read - W_2_new_sub.float()).norm().item()
+    if write_error > 1e-3:
+        print(f"  [WARNING] Weight write-back error: {write_error:.6f}")
+
+    layer_name = (
+        projection_module_name.rsplit(".net.", 1)[0]
         if ".net." in projection_module_name
-        else projection_module_name,
+        else projection_module_name
+    )
+    return WeightEditResult(
+        layer_name=layer_name,
         projection_module_name=projection_module_name,
         channel_indices=channel_indices,
-        concept_direction=concept_direction.cpu(),
+        concept_direction=primary_r.cpu(),
+        num_directions=num_directions,
         weight_delta_norm=delta_norm,
         original_weight_norm=original_norm,
+        original_concept_response_norm=original_concept_response_norm,
+        edited_concept_response_norm=edited_concept_response_norm,
+        direction_cosine=direction_cosine,
+        suppression_strength=suppression_strength,
+        use_aggressive_mode=use_aggressive_mode,
     )
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-layer convenience wrapper
+# ─────────────────────────────────────────────────────────────────────────────
 
 def edit_multiple_layers(
     backbone: nn.Module,
     layer_edits: List[Dict],
     suppression_strength: float = 1.0,
+    use_aggressive_mode: bool = False,
 ) -> List[WeightEditResult]:
-    """Apply weight edits to multiple FFN layers.
+    """Apply rank-d weight edits to multiple FFN layers.
 
-    Parameters
-    ----------
-    backbone : nn.Module
-        The denoising backbone.
-    layer_edits : list of dict
-        Each dict must contain:
-        - ``"projection_module_name"``: str
-        - ``"channel_indices"``: list of int
-        - ``"concept_direction"``: Tensor of shape (k,)
-        - ``"cpca_result"``: Optional[CPCAResult]
-    suppression_strength : float
-        Global suppression strength applied to all layers.
-
-    Returns
-    -------
-    List of WeightEditResult, one per layer.
+    Each dict in ``layer_edits`` must contain:
+    - ``"projection_module_name"``: str
+    - ``"channel_indices"``: list of int
+    - ``"concept_directions"``: Tensor (d, k) or (k,)
+    - ``"cpca_result"`` (optional, ignored): kept for API compat
     """
     results = []
     for edit in layer_edits:
@@ -237,51 +295,99 @@ def edit_multiple_layers(
             backbone=backbone,
             projection_module_name=edit["projection_module_name"],
             channel_indices=edit["channel_indices"],
-            concept_direction=edit["concept_direction"],
-            cpca_result=edit.get("cpca_result"),
+            concept_directions=edit["concept_directions"],
             suppression_strength=suppression_strength,
+            use_aggressive_mode=use_aggressive_mode,
+            cpca_result=edit.get("cpca_result"),
         )
         results.append(result)
     return results
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Verification
+# ─────────────────────────────────────────────────────────────────────────────
+
 def verify_edit(
     backbone: nn.Module,
     edit_result: WeightEditResult,
 ) -> Dict[str, float]:
-    """Verify that the weight edit successfully suppresses the concept direction.
+    """Compute suppression verification metrics (primary direction).
 
-    Checks that the concept direction's projection through the modified
-    W_2 sub-matrix is near zero.
-
-    Returns
-    -------
-    Dict with verification metrics.
+    Key metrics
+    -----------
+    suppression_factor : float
+        ‖W_new @ r₁‖ / ‖W_old @ r₁‖ = |1 − λ|:
+          λ = 1.0 → 0.00  (complete suppression)
+          λ = 2.0 → 1.00  (reflection, same magnitude, direction inverted)
+    direction_cosine : float
+        cos(W_old @ r₁, W_new @ r₁):
+          +1 same direction (λ < 1)   0 suppressed (λ = 1)   −1 inverted (λ > 1)
+    weight_change_ratio : float
+        ‖W_new − W_old‖_F / ‖W_old‖_F
     """
     module_lookup = dict(backbone.named_modules())
     proj_module = module_lookup[edit_result.projection_module_name]
     weight = proj_module.weight.data.float()
-
     idx = torch.tensor(
-        edit_result.channel_indices,
-        dtype=torch.long,
-        device=weight.device,
+        edit_result.channel_indices, dtype=torch.long, device=weight.device
     )
-    W_2_sub = weight[:, idx]  # (d_out, k)
-
+    W_2_sub = weight[:, idx]                              # edited weight
     r = edit_result.concept_direction.float().to(weight.device)
 
-    # The concept direction's contribution through W_2
-    # output_concept = W_2_sub @ r → should be near zero
-    output_concept = W_2_sub @ r
-    suppression_ratio = output_concept.norm().item() / (
-        W_2_sub.norm().item() * r.norm().item() + 1e-10
+    current_response_norm = (W_2_sub @ r).norm().item()
+    original_response_norm = edit_result.original_concept_response_norm
+    suppression_factor = current_response_norm / (original_response_norm + 1e-10)
+    weight_change_ratio = edit_result.weight_delta_norm / (
+        edit_result.original_weight_norm + 1e-10
     )
-
     return {
-        "concept_output_norm": output_concept.norm().item(),
-        "suppression_ratio": suppression_ratio,
-        "weight_change_ratio": edit_result.weight_delta_norm / (
-            edit_result.original_weight_norm + 1e-10
-        ),
+        "suppression_factor":         suppression_factor,
+        "direction_cosine":           edit_result.direction_cosine,
+        "concept_response_before":    original_response_norm,
+        "concept_response_after":     current_response_norm,
+        "weight_change_ratio":        weight_change_ratio,
+        "suppression_strength":       edit_result.suppression_strength,
+        "use_aggressive_mode":        float(edit_result.use_aggressive_mode),
+        "num_directions":             float(edit_result.num_directions),
     }
+
+
+def print_verification(
+    edit_result: WeightEditResult,
+    verification: Dict[str, float],
+) -> None:
+    """Pretty-print suppression verification for one layer."""
+    sf   = verification["suppression_factor"]
+    dc   = verification["direction_cosine"]
+    rb   = verification["concept_response_before"]
+    ra   = verification["concept_response_after"]
+    wcr  = verification["weight_change_ratio"]
+    lam  = verification["suppression_strength"]
+    agg  = bool(verification["use_aggressive_mode"])
+    nd   = int(verification["num_directions"])
+
+    # Direction interpretation
+    if ra < 1e-6:
+        direction_tag = "已归零 (完全抑制)"
+    elif dc > 0.5:
+        direction_tag = f"同向  (部分抑制)   cos={dc:+.3f}"
+    elif dc < -0.5:
+        direction_tag = f"已反转 (激进模式)  cos={dc:+.3f}"
+    else:
+        direction_tag = f"近正交             cos={dc:+.3f}"
+
+    pct_suppressed = max(0.0, 1.0 - sf) * 100
+    bar_len = 30
+    filled = int(round(pct_suppressed / 100 * bar_len))
+    bar = "█" * filled + "░" * (bar_len - filled)
+
+    print(f"\n  层: {edit_result.layer_name}")
+    print(f"  ├─ 修改通道数    : {len(edit_result.channel_indices)}")
+    print(f"  ├─ PCA 方向数    : {nd}  (rank-{nd} 编辑)")
+    print(f"  ├─ 编辑参数      : λ={lam:.1f}  aggressive={'是' if agg else '否'}")
+    print(f"  ├─ 概念响应幅度  : {rb:.4f} → {ra:.4f}  (主方向 r₁)")
+    print(f"  │    抑制因子    : {sf:.4f}  (理论值 |1−λ|={abs(1-lam):.2f})")
+    print(f"  │    [{bar}] {pct_suppressed:.1f}% 幅度抑制")
+    print(f"  ├─ 响应方向      : {direction_tag}")
+    print(f"  └─ 权重扰动比    : {wcr*100:.2f}%")

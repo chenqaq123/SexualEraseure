@@ -1,24 +1,43 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import json
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 
 
 @dataclass
 class GuardLayer:
+    # ── Module identity ───────────────────────────────────────────────────────
     ff_name: str
     hidden_module_name: str
     projection_module_name: str
+    # ── Channel selection ─────────────────────────────────────────────────────
     selected_channels: List[int]
     cad_candidate_channels: List[int]
+    # ── Concept direction(s) ──────────────────────────────────────────────────
+    # steering_vector: first (primary) PCA direction, shape (k,).
+    # Kept for backward compatibility with older artifacts and hook-based steering.
     steering_vector: List[float]
-    layer_score: float
-    positive_hook_calls: int
-    negative_hook_calls: int
+    # concept_directions: all PCA directions, shape (d, k).
+    # d=1 means rank-1 (same as steering_vector); d>1 means rank-d edit.
+    # None for artifacts built before PCA support was added.
+    concept_directions: Optional[List[List[float]]] = None
+    # Explained variance ratio for each retained PCA direction.
+    pca_explained_variance_ratios: Optional[List[float]] = None
+    # ── Layer scoring / ranking ───────────────────────────────────────────────
+    layer_score: float = 0.0           # adjusted score used for ranking (= cad × prior)
+    cad_raw_score: float = 0.0         # raw CAD score before prior weighting
+    layer_rank: int = 0                # 1-indexed rank across all candidate layers
+    # ── Channel selection diagnostics ────────────────────────────────────────
+    ssv_scores_selected: Optional[List[float]] = None   # SSV score per selected channel
+    # ── PCA diagnostics ───────────────────────────────────────────────────────
+    pca_n_samples: int = 0             # rows in the concept-diff matrix fed to PCA
+    # ── Hook call counts ──────────────────────────────────────────────────────
+    positive_hook_calls: int = 0
+    negative_hook_calls: int = 0
 
 
 @dataclass
@@ -35,7 +54,15 @@ class GuardArtifact:
     positive_prompts: List[str]
     negative_prompts: List[str]
     metadata: Dict[str, Any]
+    # Full layer ranking table (all candidates, including non-selected layers).
+    # Each entry: {rank, ff_name, cad_score_raw, cad_score_adjusted,
+    #              prior_weight, selected, channel_budget}
+    layer_ranking: Optional[List[Dict[str, Any]]] = None
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Serialisation helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 def save_artifact(artifact: GuardArtifact, output_path: str | Path) -> None:
     output_path = Path(output_path)
@@ -50,8 +77,10 @@ def save_artifact(artifact: GuardArtifact, output_path: str | Path) -> None:
 
 
 def load_artifact(path: str | Path) -> GuardArtifact:
-    data = torch.load(path, map_location="cpu")
+    data = torch.load(path, map_location="cpu", weights_only=False)
+
     if "layers" not in data:
+        # ── Legacy single-layer format ────────────────────────────────────────
         legacy_layer = GuardLayer(
             ff_name=data.get("metadata", {}).get("selected_ffn", "legacy_ff"),
             hidden_module_name=data["hidden_module_name"],
@@ -83,5 +112,19 @@ def load_artifact(path: str | Path) -> GuardArtifact:
             },
         }
     else:
-        data["layers"] = [GuardLayer(**layer) for layer in data["layers"]]
+        # ── Current multi-layer format ────────────────────────────────────────
+        # GuardLayer may have been saved without the optional PCA fields;
+        # fill missing keys with None defaults before constructing.
+        layers = []
+        for layer_dict in data["layers"]:
+            layer_dict.setdefault("concept_directions", None)
+            layer_dict.setdefault("pca_explained_variance_ratios", None)
+            layer_dict.setdefault("cad_raw_score", layer_dict.get("layer_score", 0.0))
+            layer_dict.setdefault("layer_rank", 0)
+            layer_dict.setdefault("ssv_scores_selected", None)
+            layer_dict.setdefault("pca_n_samples", 0)
+            layers.append(GuardLayer(**layer_dict))
+        data["layers"] = layers
+        data.setdefault("layer_ranking", None)
+
     return GuardArtifact(**data)

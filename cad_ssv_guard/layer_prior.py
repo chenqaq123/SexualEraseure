@@ -57,8 +57,9 @@ _ZONE_CONFIGS: Dict[str, SemanticZoneConfig] = {
     # UNet: semantic content encoded in mid → early up_blocks
     "sd1": SemanticZoneConfig(center=0.50, sigma=0.20, hard_min=0.20, hard_max=0.80),
 
-    # SD3 MMDiT: semantic zone in middle third of transformer stack
-    "sd3": SemanticZoneConfig(center=0.45, sigma=0.20, hard_min=0.15, hard_max=0.80),
+    # SD3 MMDiT: 24 blocks, empirical observation shows block 7 (~0.31 depth)
+    # is most concept-sensitive. Prior provides soft guidance only.
+    "sd3": SemanticZoneConfig(center=0.31, sigma=0.20, hard_min=0.0, hard_max=1.0),
 
     # FLUX DiT: dual→single stream, semantics in mid-range
     "flux": SemanticZoneConfig(center=0.45, sigma=0.22, hard_min=0.15, hard_max=0.80),

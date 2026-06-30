@@ -1,13 +1,28 @@
+# Result / data files
 *.json
-*.pt
-__pycache__/
-*.png
-refs/
+*.jsonl
+*.csv
 *.txt
+*.pt
+*.png
+*.mp4
+*.safetensors
+*.log
+*.pdf
+
+# Result / scratch dirs
 eval_outputs/
 artifacts/
-.DS_Store/
-papers/
 outputs/
+papers/
+refs/
+figures/
+
+# Vendored release repo (managed in its own git remote)
+UniErase/
+
+# Tooling / OS junk
+__pycache__/
 .claude/
 .qoder/
+.DS_Store

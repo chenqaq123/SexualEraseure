@@ -216,11 +216,11 @@ class SD3Backend(ModelBackend):
 
     @property
     def default_height(self) -> int:
-        return 1024
+        return 512
 
     @property
     def default_width(self) -> int:
-        return 1024
+        return 512
 
     @property
     def default_guidance_scale(self) -> float:
@@ -261,17 +261,31 @@ class SD3Backend(ModelBackend):
         latents = latents_dict["latents"]
         # FlowMatchEulerDiscreteScheduler has no scale_model_input;
         # SD3 passes latents directly to the transformer.
-        latent_input = latents.repeat(2, 1, 1, 1)
-        # SD3 transformer expects timestep expanded to the batch dimension
-        t = timestep.expand(latent_input.shape[0])
-        noise_pred = pipe.transformer(
-            hidden_states=latent_input,
-            encoder_hidden_states=text_dict["encoder_hidden_states"],
-            pooled_projections=text_dict["pooled_projections"],
-            timestep=t,
+
+        # Memory-efficient: run positive and negative separately to avoid
+        # 2x activation memory in the transformer (critical for SD3 on 24GB GPUs).
+        t_single = timestep.item() if timestep.numel() == 1 else timestep
+
+        # Positive forward
+        noise_pred_pos = pipe.transformer(
+            hidden_states=latents,
+            encoder_hidden_states=text_dict["encoder_hidden_states"][0:1],
+            pooled_projections=text_dict["pooled_projections"][0:1],
+            timestep=torch.tensor([t_single], device=latents.device),
             return_dict=False,
-        )[0]  # (2, C, H, W)
-        return noise_pred[0:1], noise_pred[1:2].detach()
+        )[0]  # (1, C, H, W)
+
+        # Negative forward
+        with torch.no_grad():
+            noise_pred_neg = pipe.transformer(
+                hidden_states=latents,
+                encoder_hidden_states=text_dict["encoder_hidden_states"][1:2],
+                pooled_projections=text_dict["pooled_projections"][1:2],
+                timestep=torch.tensor([t_single], device=latents.device),
+                return_dict=False,
+            )[0]  # (1, C, H, W)
+
+        return noise_pred_pos, noise_pred_neg
 
     def scheduler_step(self, pipe, noise_pred_pos, timestep, latents_dict):
         prev = pipe.scheduler.step(
